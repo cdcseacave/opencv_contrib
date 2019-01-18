@@ -7,8 +7,10 @@
 #include <OgreApplicationContext.h>
 #include <OgreCameraMan.h>
 #include <OgreRectangle2D.h>
+#include <OgreCompositorManager.h>
 
 #include <opencv2/calib3d.hpp>
+#include <opencv2/core/utils/configuration.private.hpp>
 
 namespace cv
 {
@@ -30,11 +32,34 @@ WindowScene::~WindowScene() {}
 
 void _createTexture(const String& name, Mat image)
 {
+    PixelFormat format;
+    switch(image.type())
+    {
+    case CV_8UC4:
+        format = PF_BYTE_BGRA;
+        break;
+    case CV_8UC3:
+        format = PF_BYTE_BGR;
+        break;
+    case CV_8UC1:
+        format = PF_BYTE_L;
+        break;
+    case CV_16UC1:
+        format = PF_L16;
+        break;
+    case CV_32FC1:
+        format = PF_FLOAT32_R;
+        break;
+    default:
+        CV_Error(Error::StsBadArg, "currently supported formats are only CV_8UC1, CV_8UC3, CV_8UC4, CV_16UC1, CV_32FC1");
+        break;
+    }
+
     TextureManager& texMgr = TextureManager::getSingleton();
     TexturePtr tex = texMgr.getByName(name, RESOURCEGROUP_NAME);
 
     Image im;
-    im.loadDynamicImage(image.ptr(), image.cols, image.rows, 1, PF_BYTE_BGR);
+    im.loadDynamicImage(image.ptr(), image.cols, image.rows, 1, format);
 
     if (tex)
     {
@@ -49,8 +74,8 @@ void _createTexture(const String& name, Mat image)
 
 static void _convertRT(InputArray rot, InputArray tvec, Quaternion& q, Vector3& t, bool invert = false)
 {
-    CV_Assert(rot.empty() || rot.rows() == 3 || rot.size() == Size(3, 3),
-              tvec.empty() || tvec.rows() == 3);
+    CV_Assert_N(rot.empty() || rot.rows() == 3 || rot.size() == Size(3, 3),
+                tvec.empty() || tvec.rows() == 3);
 
     q = Quaternion::IDENTITY;
     t = Vector3::ZERO;
@@ -97,11 +122,11 @@ static void _setCameraIntrinsics(Camera* cam, InputArray _K, const Size& imsize)
 
     Matx33f K = _K.getMat();
 
-    float near = cam->getNearClipDistance();
-    float top = near * K(1, 2) / K(1, 1);
-    float left = -near * K(0, 2) / K(0, 0);
-    float right = near * (imsize.width - K(0, 2)) / K(0, 0);
-    float bottom = -near * (imsize.height - K(1, 2)) / K(1, 1);
+    float zNear = cam->getNearClipDistance();
+    float top = zNear * K(1, 2) / K(1, 1);
+    float left = -zNear * K(0, 2) / K(0, 0);
+    float right = zNear * (imsize.width - K(0, 2)) / K(0, 0);
+    float bottom = -zNear * (imsize.height - K(1, 2)) / K(1, 1);
 
     // use frustum extents instead of setFrustumOffset as the latter
     // assumes centered FOV, which is not the case
@@ -124,7 +149,7 @@ static SceneNode& _getSceneNode(SceneManager* sceneMgr, const String& name)
         if(mo)
             return *mo->getParentSceneNode()->getParentSceneNode();
     }
-    catch (ItemIdentityException&)
+    catch (const ItemIdentityException&)
     {
         // ignore
     }
@@ -134,7 +159,7 @@ static SceneNode& _getSceneNode(SceneManager* sceneMgr, const String& name)
         if (!mo)
             mo = sceneMgr->getMovableObject(name, "Light");
     }
-    catch (ItemIdentityException&)
+    catch (const ItemIdentityException&)
     {
         // ignore
     }
@@ -156,9 +181,13 @@ struct Application : public OgreBites::ApplicationContext, public OgreBites::Inp
     int flags;
 
     Application(const Ogre::String& _title, const Size& sz, int _flags)
-        : OgreBites::ApplicationContext("ovis", false), sceneMgr(NULL), title(_title), w(sz.width),
+        : OgreBites::ApplicationContext("ovis"), sceneMgr(NULL), title(_title), w(sz.width),
           h(sz.height), key_pressed(-1), flags(_flags)
     {
+        if(utils::getConfigurationParameterBool("OPENCV_OVIS_VERBOSE_LOG", false))
+            return;
+
+        // set default log with low log level
         logMgr.reset(new LogManager());
         logMgr->createLog("ovis.log", true, true, true);
         logMgr->setLogDetail(LL_LOW);
@@ -169,22 +198,23 @@ struct Application : public OgreBites::ApplicationContext, public OgreBites::Inp
         // empty impl to show cursor
     }
 
-    bool keyPressed(const OgreBites::KeyboardEvent& evt)
+    bool keyPressed(const OgreBites::KeyboardEvent& evt) CV_OVERRIDE
     {
         key_pressed = evt.keysym.sym;
         return true;
     }
 
-    bool oneTimeConfig()
+    bool oneTimeConfig() CV_OVERRIDE
     {
-        Ogre::RenderSystem* rs = getRoot()->getRenderSystemByName(RENDERSYSTEM_NAME);
-        CV_Assert(rs);
+        Ogre::String rsname = utils::getConfigurationParameterString("OPENCV_OVIS_RENDERSYSTEM", RENDERSYSTEM_NAME);
+        Ogre::RenderSystem* rs = getRoot()->getRenderSystemByName(rsname);
+        CV_Assert(rs && "Could not find rendersystem");
         getRoot()->setRenderSystem(rs);
         return true;
     }
 
     OgreBites::NativeWindowPair createWindow(const Ogre::String& name, uint32_t _w, uint32_t _h,
-                                             NameValuePairList miscParams = NameValuePairList())
+                                             NameValuePairList miscParams = NameValuePairList()) CV_OVERRIDE
     {
         Ogre::String _name = name;
         if (!sceneMgr)
@@ -206,7 +236,9 @@ struct Application : public OgreBites::ApplicationContext, public OgreBites::Inp
         return ret;
     }
 
-    void locateResources()
+    size_t numWindows() const { return mWindows.size(); }
+
+    void locateResources() CV_OVERRIDE
     {
         OgreBites::ApplicationContext::locateResources();
         ResourceGroupManager& rgm = ResourceGroupManager::getSingleton();
@@ -226,7 +258,7 @@ struct Application : public OgreBites::ApplicationContext, public OgreBites::Inp
         }
     }
 
-    void setup()
+    void setup() CV_OVERRIDE
     {
         OgreBites::ApplicationContext::setup();
 
@@ -246,11 +278,11 @@ class WindowSceneImpl : public WindowScene
     Ptr<OgreBites::CameraMan> camman;
     Ptr<Rectangle2D> bgplane;
 
-    Ogre::RenderTarget* frameSrc;
     Ogre::RenderTarget* depthRTT;
+    int flags;
 public:
-    WindowSceneImpl(Ptr<Application> app, const String& _title, const Size& sz, int flags)
-        : title(_title), root(app->getRoot()), depthRTT(NULL)
+    WindowSceneImpl(Ptr<Application> app, const String& _title, const Size& sz, int _flags)
+        : title(_title), root(app->getRoot()), depthRTT(NULL), flags(_flags)
     {
         if (!app->sceneMgr)
         {
@@ -287,7 +319,11 @@ public:
         {
             camman.reset(new OgreBites::CameraMan(camNode));
             camman->setStyle(OgreBites::CS_ORBIT);
-            camNode->setFixedYawAxis(true, Vector3::NEGATIVE_UNIT_Y);
+#if OGRE_VERSION >= ((1 << 16) | (11 << 8) | 5)
+            camman->setFixedYaw(false);
+#else
+            camNode->setFixedYawAxis(true, Vector3::NEGATIVE_UNIT_Y); // OpenCV +Y in Ogre CS
+#endif
         }
 
         if (!app->sceneMgr)
@@ -306,23 +342,38 @@ public:
         }
 
         rWin->addViewport(cam);
-        frameSrc = rWin;
+    }
 
-        if (flags & SCENE_RENDER_FLOAT)
+    ~WindowSceneImpl()
+    {
+        if (flags & SCENE_SEPERATE)
         {
-            // also render into an offscreen texture
-            // currently this draws everything twice, but we spare the float->byte conversion for display
-            TexturePtr tex = TextureManager::getSingleton().createManual(
-                title + "_rt", RESOURCEGROUP_NAME, TEX_TYPE_2D, sz.width, sz.height, 0, PF_FLOAT32_RGBA,
-                TU_RENDERTARGET);
-            frameSrc = tex->getBuffer()->getRenderTarget();
-            frameSrc->addViewport(cam);
+            TextureManager& texMgr =  TextureManager::getSingleton();
+
+            MaterialManager::getSingleton().remove(bgplane->getMaterial());
+            bgplane.release();
+            String texName = "_"+sceneMgr->getName() + "_DefaultBackground";
+            texMgr.remove(texName, RESOURCEGROUP_NAME);
+
+            texName = sceneMgr->getName() + "_Background";
+            if(texMgr.resourceExists(texName, RESOURCEGROUP_NAME))
+            {
+                texMgr.remove(texName, RESOURCEGROUP_NAME);
+            }
+        }
+
+        if(_app->sceneMgr == sceneMgr && (flags & SCENE_SEPERATE))
+        {
+            // this is the root window owning the context
+            CV_Assert(_app->numWindows() == 1 && "the first OVIS window must be deleted last");
+            _app->closeApp();
+            _app.release();
         }
     }
 
-    void setBackground(InputArray image)
+    void setBackground(InputArray image) CV_OVERRIDE
     {
-        CV_Assert(image.type() == CV_8UC3, bgplane);
+        CV_Assert(bgplane);
 
         String name = sceneMgr->getName() + "_Background";
 
@@ -339,7 +390,91 @@ public:
         bgplane->setVisible(true);
     }
 
-    void setBackground(const Scalar& color)
+    void setCompositors(const std::vector<String>& names) CV_OVERRIDE
+    {
+        CompositorManager& cm = CompositorManager::getSingleton();
+        // this should be applied to all owned render targets
+        Ogre::RenderTarget* targets[] = {rWin, depthRTT};
+
+        for(int j = 0; j < 2; j++)
+        {
+            Ogre::RenderTarget* tgt = targets[j];
+            if(!tgt) continue;
+
+            Viewport* vp = tgt->getViewport(0);
+            cm.removeCompositorChain(vp); // remove previous configuration
+
+            for(size_t i = 0; i < names.size(); i++)
+            {
+                if (!cm.addCompositor(vp, names[i])) {
+                    LogManager::getSingleton().logError("Failed to add compositor: " + names[i]);
+                    continue;
+                }
+                cm.setCompositorEnabled(vp, names[i], true);
+            }
+        }
+    }
+
+    void getCompositorTexture(const String& compname, const String& texname, OutputArray out,
+                              int mrtIndex) CV_OVERRIDE
+    {
+        CompositorManager& cm = CompositorManager::getSingleton();
+        CompositorChain* chain = cm.getCompositorChain(rWin->getViewport(0));
+        CV_Assert(chain && "no active compositors");
+
+        CompositorInstance* inst = chain->getCompositor(compname);
+        if(!inst)
+            CV_Error_(Error::StsBadArg, ("no active compositor named: %s", compname.c_str()));
+
+        TexturePtr tex = inst->getTextureInstance(texname, mrtIndex);
+        if(!tex)
+            CV_Error_(Error::StsBadArg, ("no texture named: %s", texname.c_str()));
+
+        PixelFormat src_type = tex->getFormat();
+        int dst_type;
+        switch(src_type)
+        {
+        case PF_R8:
+        case PF_L8:
+            dst_type = CV_8U;
+            break;
+        case PF_BYTE_RGB:
+            dst_type = CV_8UC3;
+            break;
+        case PF_BYTE_RGBA:
+            dst_type = CV_8UC4;
+            break;
+        case PF_FLOAT32_R:
+            dst_type = CV_32F;
+            break;
+        case PF_FLOAT32_RGB:
+            dst_type = CV_32FC3;
+            break;
+        case PF_FLOAT32_RGBA:
+            dst_type = CV_32FC4;
+            break;
+        case PF_L16:
+        case PF_DEPTH:
+            dst_type = CV_16U;
+            break;
+        default:
+            CV_Error(Error::StsNotImplemented, "unsupported texture format");
+        }
+
+        out.create(tex->getHeight(), tex->getWidth(), dst_type);
+
+        Mat mat = out.getMat();
+        PixelBox pb(tex->getWidth(), tex->getHeight(), 1, src_type, mat.ptr());
+        tex->getBuffer()->blitToMemory(pb, pb);
+
+        if(CV_MAT_CN(dst_type) < 3)
+            return;
+
+        // convert to OpenCV channel order
+        cvtColor(mat, mat, CV_MAT_CN(dst_type) == 3 ? COLOR_RGB2BGR : COLOR_RGBA2BGRA);
+    }
+
+    void setBackground(const Scalar& color) CV_OVERRIDE
     {
         // hide background plane
         bgplane->setVisible(false);
@@ -347,11 +482,9 @@ public:
         // BGRA as uchar
         ColourValue _color = ColourValue(color[2], color[1], color[0], color[3]) / 255;
         rWin->getViewport(0)->setBackgroundColour(_color);
-        if(frameSrc != rWin)
-            frameSrc->getViewport(0)->setBackgroundColour(_color);
     }
 
-    void createEntity(const String& name, const String& meshname, InputArray tvec, InputArray rot)
+    void createEntity(const String& name, const String& meshname, InputArray tvec, InputArray rot) CV_OVERRIDE
     {
         Entity* ent = sceneMgr->createEntity(name, meshname, RESOURCEGROUP_NAME);
 
@@ -362,15 +495,20 @@ public:
         node->attachObject(ent);
     }
 
-    void removeEntity(const String& name) {
+    void removeEntity(const String& name) CV_OVERRIDE {
         SceneNode& node = _getSceneNode(sceneMgr, name);
         node.getAttachedObject(name)->detachFromParent();
+
+        // only one of the following will do something
+        sceneMgr->destroyLight(name);
         sceneMgr->destroyEntity(name);
+        sceneMgr->destroyCamera(name);
+
         sceneMgr->destroySceneNode(&node);
     }
 
     Rect2d createCameraEntity(const String& name, InputArray K, const Size& imsize, float zFar,
-                              InputArray tvec, InputArray rot)
+                              InputArray tvec, InputArray rot) CV_OVERRIDE
     {
         MaterialPtr mat = MaterialManager::getSingleton().create(name, RESOURCEGROUP_NAME);
         Pass* rpass = mat->getTechniques()[0]->getPasses()[0];
@@ -403,7 +541,7 @@ public:
     }
 
     void createLightEntity(const String& name, InputArray tvec, InputArray rot, const Scalar& diffuseColour,
-                           const Scalar& specularColour)
+                           const Scalar& specularColour) CV_OVERRIDE
     {
         Light* light = sceneMgr->createLight(name);
         light->setDirection(Vector3::NEGATIVE_UNIT_Z);
@@ -418,7 +556,7 @@ public:
         node->attachObject(light);
     }
 
-    void updateEntityPose(const String& name, InputArray tvec, InputArray rot)
+    void updateEntityPose(const String& name, InputArray tvec, InputArray rot) CV_OVERRIDE
     {
         SceneNode& node = _getSceneNode(sceneMgr, name);
         Quaternion q;
@@ -428,7 +566,7 @@ public:
         node.translate(t, Ogre::Node::TS_LOCAL);
     }
 
-    void setEntityPose(const String& name, InputArray tvec, InputArray rot, bool invert)
+    void setEntityPose(const String& name, InputArray tvec, InputArray rot, bool invert) CV_OVERRIDE
     {
         SceneNode& node = _getSceneNode(sceneMgr, name);
         Quaternion q;
@@ -438,7 +576,7 @@ public:
         node.setPosition(t);
     }
 
-    void setEntityProperty(const String& name, int prop, const String& value)
+    void setEntityProperty(const String& name, int prop, const String& value) CV_OVERRIDE
     {
         CV_Assert(prop == ENTITY_MATERIAL);
         SceneNode& node = _getSceneNode(sceneMgr, name);
@@ -458,11 +596,40 @@ public:
         ent->setMaterial(mat);
     }
 
-    void setEntityProperty(const String& name, int prop, const Scalar& value)
+    void setEntityProperty(const String& name, int prop, const Scalar& value) CV_OVERRIDE
     {
         CV_Assert(prop == ENTITY_SCALE);
         SceneNode& node = _getSceneNode(sceneMgr, name);
         node.setScale(value[0], value[1], value[2]);
+    }
+
+    void getEntityProperty(const String& name, int prop, OutputArray value)
+    {
+        SceneNode& node = _getSceneNode(sceneMgr, name);
+        switch(prop)
+        {
+        case ENTITY_SCALE:
+        {
+            Vector3 s = node.getScale();
+            Mat_<Real>(1, 3, s.ptr()).copyTo(value);
+            return;
+        }
+        case ENTITY_AABB_WORLD:
+        {
+            Entity* ent = dynamic_cast<Entity*>(node.getAttachedObject(name));
+            CV_Assert(ent && "invalid entity");
+            AxisAlignedBox aabb = ent->getWorldBoundingBox(true);
+            Vector3 mn = aabb.getMinimum();
+            Vector3 mx = aabb.getMaximum();
+            Mat_<Real> ret(2, 3);
+            Mat_<Real>(1, 3, mn.ptr()).copyTo(ret.row(0));
+            Mat_<Real>(1, 3, mx.ptr()).copyTo(ret.row(1));
+            ret.copyTo(value);
+            return;
+        }
+        default:
+            CV_Error(Error::StsBadArg, "unsupported property");
+        }
     }
 
     void _createBackground()
@@ -493,22 +660,19 @@ public:
         sceneMgr->getRootSceneNode()->createChildSceneNode()->attachObject(bgplane.get());
     }
 
-    void getScreenshot(OutputArray frame)
+    void getScreenshot(OutputArray frame) CV_OVERRIDE
     {
-        PixelFormat src_type = frameSrc->suggestPixelFormat();
-        int dst_type = src_type == PF_BYTE_RGB ? CV_8UC3 : CV_32FC4;
-
-        frame.create(frameSrc->getHeight(), frameSrc->getWidth(), dst_type);
+        frame.create(rWin->getHeight(), rWin->getWidth(), CV_8UC3);
 
         Mat out = frame.getMat();
-        PixelBox pb(frameSrc->getWidth(), frameSrc->getHeight(), 1, src_type, out.ptr());
-        frameSrc->copyContentsToMemory(pb, pb);
+        PixelBox pb(rWin->getWidth(), rWin->getHeight(), 1, PF_BYTE_RGB, out.ptr());
+        rWin->copyContentsToMemory(pb, pb);
 
         // convert to OpenCV channel order
-        cvtColor(out, out, dst_type == CV_8UC3 ? COLOR_RGB2BGR : COLOR_RGBA2BGRA);
+        cvtColor(out, out, COLOR_RGB2BGR);
     }
 
-    void getDepth(OutputArray depth)
+    void getDepth(OutputArray depth) CV_OVERRIDE
     {
         Camera* cam = sceneMgr->getCamera(title);
         if (!depthRTT)
@@ -516,8 +680,8 @@ public:
             // render into an offscreen texture
             // currently this draws everything twice as OGRE lacks depth texture attachments
             TexturePtr tex = TextureManager::getSingleton().createManual(
-                title + "_Depth", RESOURCEGROUP_NAME, TEX_TYPE_2D, frameSrc->getWidth(),
-                frameSrc->getHeight(), 0, PF_DEPTH, TU_RENDERTARGET);
+                title + "_Depth", RESOURCEGROUP_NAME, TEX_TYPE_2D, rWin->getWidth(),
+                rWin->getHeight(), 0, PF_DEPTH, TU_RENDERTARGET);
             depthRTT = tex->getBuffer()->getRenderTarget();
             depthRTT->addViewport(cam);
             depthRTT->setAutoUpdated(false); // only update when requested
@@ -540,8 +704,12 @@ public:
         ndc = (2 * f * n) / ndc;
     }
 
-    void fixCameraYawAxis(bool useFixed, InputArray _up)
+    void fixCameraYawAxis(bool useFixed, InputArray _up) CV_OVERRIDE
     {
+#if OGRE_VERSION >= ((1 << 16) | (11 << 8) | 5)
+        if(camman) camman->setFixedYaw(useFixed);
+#endif
+
         Vector3 up = Vector3::NEGATIVE_UNIT_Y;
         if (!_up.empty())
         {
@@ -551,7 +719,7 @@ public:
         camNode->setFixedYawAxis(useFixed, up);
     }
 
-    void setCameraPose(InputArray tvec, InputArray rot, bool invert)
+    void setCameraPose(InputArray tvec, InputArray rot, bool invert) CV_OVERRIDE
     {
         Quaternion q;
         Vector3 t;
@@ -564,7 +732,7 @@ public:
             camNode->setPosition(t);
     }
 
-    void getCameraPose(OutputArray R, OutputArray tvec, bool invert)
+    void getCameraPose(OutputArray R, OutputArray tvec, bool invert) CV_OVERRIDE
     {
         Matrix3 _R;
         // toOGRE.Inverse() == toOGRE
@@ -593,13 +761,16 @@ public:
         }
     }
 
-    void setCameraIntrinsics(InputArray K, const Size& imsize)
+    void setCameraIntrinsics(InputArray K, const Size& imsize, float zNear, float zFar) CV_OVERRIDE
     {
         Camera* cam = sceneMgr->getCamera(title);
-        _setCameraIntrinsics(cam, K, imsize);
+
+        if(zNear >= 0) cam->setNearClipDistance(zNear);
+        if(zFar >= 0) cam->setFarClipDistance(zFar);
+        if(!K.empty()) _setCameraIntrinsics(cam, K, imsize);
     }
 
-    void setCameraLookAt(const String& target, InputArray offset)
+    void setCameraLookAt(const String& target, InputArray offset) CV_OVERRIDE
     {
         SceneNode* tgt = sceneMgr->getEntity(target)->getParentSceneNode();
 
@@ -669,6 +840,13 @@ void setMaterialProperty(const String& name, int prop, const Scalar& val)
         col.saturate();
         rpass->setEmissive(col);
         break;
+    case MATERIAL_LINE_WIDTH:
+#if OGRE_VERSION >= ((1 << 16) | (11 << 8) | 2)
+        rpass->setLineWidth(val[0]);
+#else
+        CV_Error(Error::StsError, "needs OGRE 1.11.2+ for this");
+#endif
+        break;
     default:
         CV_Error(Error::StsBadArg, "invalid or non Scalar property");
         break;
@@ -677,20 +855,23 @@ void setMaterialProperty(const String& name, int prop, const Scalar& val)
 
 void setMaterialProperty(const String& name, int prop, const String& value)
 {
-    CV_Assert(prop == MATERIAL_TEXTURE, _app);
+    CV_Assert_N(prop >= MATERIAL_TEXTURE0, prop <= MATERIAL_TEXTURE3, _app);
 
     MaterialPtr mat = MaterialManager::getSingleton().getByName(name, RESOURCEGROUP_NAME);
     CV_Assert(mat);
 
     Pass* rpass = mat->getTechniques()[0]->getPasses()[0];
 
-    if (rpass->getTextureUnitStates().empty())
+    size_t texUnit = prop - MATERIAL_TEXTURE0;
+    CV_Assert(texUnit <= rpass->getTextureUnitStates().size());
+
+    if (rpass->getTextureUnitStates().size() <= texUnit)
     {
         rpass->createTextureUnitState(value);
         return;
     }
 
-    rpass->getTextureUnitStates()[0]->setTextureName(value);
+    rpass->getTextureUnitStates()[texUnit]->setTextureName(value);
 }
 
 static bool setShaderProperty(const GpuProgramParametersSharedPtr& params, const String& prop,
@@ -746,6 +927,14 @@ void setMaterialProperty(const String& name, const String& prop, const Scalar& v
 
     if(!set)
         CV_Error_(Error::StsBadArg, ("shader parameter named '%s' not found", prop.c_str()));
+}
+
+void updateTexture(const String& name, InputArray image)
+{
+    CV_Assert(_app);
+    TexturePtr tex = TextureManager::getSingleton().getByName(name, RESOURCEGROUP_NAME);
+    CV_Assert(tex);
+    _createTexture(name, image.getMat());
 }
 }
 }
